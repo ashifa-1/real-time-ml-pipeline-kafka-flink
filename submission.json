@@ -1,0 +1,12 @@
+{
+  "project_title": "Real-Time ML Feature Pipeline",
+  "description": "A streaming pipeline using Kafka and Python to generate real-time ML features including user behavior, content engagement, and category affinity.",
+  "technologies": ["Kafka", "Python", "Streamlit", "Docker"],
+  "features": [
+    "avg_dwell_time_window",
+    "click_rate_window",
+    "engagement_rate",
+    "category_affinity"
+  ],
+  "notes": "Implemented a Python-based stream processor to simulate Apache Flink functionality including streaming, joins, and windowing."
+}
