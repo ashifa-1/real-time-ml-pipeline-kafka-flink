@@ -16,4 +16,4 @@ features = []
 
 for message in consumer:
     features.append(message.value)
-    data_placeholder.write(features[-20:])
+    data_placeholder.dataframe(features[-20:])
