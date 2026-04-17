@@ -1,31 +1,39 @@
 from kafka import KafkaConsumer, KafkaProducer
 import json
 from datetime import datetime
-
 from dotenv import load_dotenv
 import os
+import time
 
 load_dotenv()
 
-KAFKA_SERVER = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+KAFKA_SERVER = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
-consumer = KafkaConsumer(
-    "user-events",
-    bootstrap_servers=KAFKA_SERVER,
-    value_deserializer=lambda x: json.loads(x.decode("utf-8"))
-)
+def create_consumer(topic):
+    while True:
+        try:
+            return KafkaConsumer(
+                topic,
+                bootstrap_servers=KAFKA_SERVER,
+                value_deserializer=lambda x: json.loads(x.decode("utf-8")),
+                auto_offset_reset="earliest"
+            )
+        except:
+            time.sleep(2)
 
-metadata_consumer = KafkaConsumer(
-    "content-metadata",
-    bootstrap_servers=KAFKA_SERVER,
-    value_deserializer=lambda x: json.loads(x.decode("utf-8")),
-    auto_offset_reset="earliest"
-)
+def create_producer():
+    while True:
+        try:
+            return KafkaProducer(
+                bootstrap_servers=KAFKA_SERVER,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8")
+            )
+        except:
+            time.sleep(2)
 
-producer = KafkaProducer(
-    bootstrap_servers=KAFKA_SERVER,
-    value_serializer=lambda v: json.dumps(v).encode("utf-8")
-)
+consumer = create_consumer("user-events")
+metadata_consumer = create_consumer("content-metadata")
+producer = create_producer()
 
 user_data = {}
 content_data = {}
@@ -47,9 +55,7 @@ for message in consumer:
     content = event["content_id"]
     event_type = event["event_type"]
 
-    category = None
-    if content in metadata_store:
-        category = metadata_store[content]["category"]
+    category = metadata_store.get(content, {}).get("category")
 
     if user not in user_data:
         user_data[user] = {"events": [], "clicks": 0}
@@ -98,10 +104,7 @@ for message in consumer:
     likes = content_data[content]["likes"]
     shares = content_data[content]["shares"]
 
-    if views == 0:
-        engagement_rate = 0
-    else:
-        engagement_rate = (likes + shares) / views
+    engagement_rate = (likes + shares) / views if views > 0 else 0
 
     producer.send("feature-store", value={
         "entity_id": content,
@@ -110,7 +113,7 @@ for message in consumer:
         "computed_at": datetime.utcnow().isoformat() + "Z"
     })
 
-    if category is not None:
+    if category:
         if user not in category_data:
             category_data[user] = {}
 
@@ -126,3 +129,5 @@ for message in consumer:
                 "feature_value": category_data[user][cat],
                 "computed_at": datetime.utcnow().isoformat() + "Z"
             })
+
+    producer.flush()
