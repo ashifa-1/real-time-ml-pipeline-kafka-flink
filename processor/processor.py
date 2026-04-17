@@ -2,21 +2,28 @@ from kafka import KafkaConsumer, KafkaProducer
 import json
 from datetime import datetime
 
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+KAFKA_SERVER = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+
 consumer = KafkaConsumer(
     "user-events",
-    bootstrap_servers="localhost:9092",
+    bootstrap_servers=KAFKA_SERVER,
     value_deserializer=lambda x: json.loads(x.decode("utf-8"))
 )
 
 metadata_consumer = KafkaConsumer(
     "content-metadata",
-    bootstrap_servers="localhost:9092",
+    bootstrap_servers=KAFKA_SERVER,
     value_deserializer=lambda x: json.loads(x.decode("utf-8")),
     auto_offset_reset="earliest"
 )
 
 producer = KafkaProducer(
-    bootstrap_servers="localhost:9092",
+    bootstrap_servers=KAFKA_SERVER,
     value_serializer=lambda v: json.dumps(v).encode("utf-8")
 )
 

@@ -4,8 +4,16 @@ import time
 import random
 from datetime import datetime, timedelta
 
+
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+KAFKA_SERVER = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+
 producer = KafkaProducer(
-    bootstrap_servers='localhost:9092',
+    bootstrap_servers=KAFKA_SERVER,
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
 
