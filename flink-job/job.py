@@ -1,5 +1,7 @@
 from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.common import Types, Time
+from pyflink.common import Types
+from pyflink.common.time import Duration
+from pyflink.common.watermark_strategy import WatermarkStrategy
 from pyflink.datastream.connectors.kafka import KafkaSource, KafkaSink
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.watermark_strategy import WatermarkStrategy
@@ -12,7 +14,7 @@ env = StreamExecutionEnvironment.get_execution_environment()
 env.set_parallelism(1)
 
 source = KafkaSource.builder() \
-    .set_bootstrap_servers("localhost:9092") \
+    .set_bootstrap_servers("kafka:9092") \
     .set_topics("user-events") \
     .set_group_id("flink-group") \
     .set_value_only_deserializer(SimpleStringSchema()) \
@@ -20,7 +22,7 @@ source = KafkaSource.builder() \
 
 stream = env.from_source(
     source,
-    WatermarkStrategy.for_bounded_out_of_orderness(Time.seconds(30)),
+    WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_seconds(30)),
     "kafka-source"
 )
 

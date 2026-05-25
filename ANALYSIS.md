@@ -1,33 +1,27 @@
 # Analysis
 
-## Batch vs Streaming Processing
+## Batch vs. Streaming Divergence
 
-Batch processing handles large volumes of data at fixed intervals, leading to higher latency. Streaming processing handles data in real-time, allowing immediate insights and updates. This project uses streaming to ensure low-latency feature computation.
+The streaming pipeline computes features continuously as events arrive, while a batch approach would only compute features at fixed intervals over a static snapshot. In this implementation, the Flink job computes user features with a 1-hour tumbling event-time window, content engagement with a 15-minute sliding window, and category affinity scores using joined metadata. A batch computation on the same event set would produce a single summary for a fixed cut-off time and would not preserve the intermediate state updates that the feature-store topic delivers in real time.
 
-## Handling Late Events
+Key differences:
 
-The producer simulates late events by introducing delayed timestamps. The processor handles them as part of the stream without strict time-based rejection, ensuring robustness in real-world scenarios.
+* Streaming features are updated immediately after a window closes and may change as new windows start. For example, `click_rate` and `avg_dwell_time` are emitted for each user every hour, while a batch run would only provide a final aggregation for the full dataset.
+* The sliding window used for `engagement_rate` produces multiple overlapping summaries every 5 minutes. A batch job cannot reproduce this near-real-time cadence without running repeatedly.
+* Late and out-of-order events are handled by watermarks in the streaming pipeline, so some events may be incorporated into earlier windows after arrival. A batch run would simply include all events in the same pass and would not expose the timing semantics of window closure.
 
-## Windowing Strategy
+Because streaming manages event time explicitly, values from the pipeline can differ from a naive batch aggregate when events arrive late or out of order. This is expected: real-time models need feature values that reflect the time boundaries of windows, not just the total counts in a static dataset.
 
-A sliding window approach is implemented using a fixed-size buffer of recent events. This simulates real-time window-based aggregation similar to frameworks like Apache Flink.
+## Late Event Handling
 
-## Join Strategy
+The Flink job is configured with event-time processing and a bounded out-of-orderness watermark strategy of exactly 30 seconds. This means the job will wait up to 30 seconds for late data before closing a window and emitting results.
 
-A stream-table join is implemented by loading content metadata into memory and enriching incoming user events. This allows combining dynamic event data with static reference data.
+Evidence from the pipeline:
 
-## Scalability Considerations
+* The producer intentionally emits at least 5% of `user-events` with timestamps between 35 and 90 seconds behind the current simulation clock.
+* The Flink job writes a separate `pipeline-metrics` stream that includes `watermark_ms` and `late_event_count` values.
+* The dashboard consumes those metrics and displays them in real time.
 
-* Kafka ensures distributed and scalable ingestion
-* Stateless processing logic can be extended to distributed systems
-* Feature-store topic allows multiple downstream consumers
+If an event arrives more than 30 seconds behind the current watermark, it is classified as late. The implementation counts these events and exposes them in the dashboard as `Late Events Count`. This makes the watermark behavior visible and explains why some events are no longer eligible for their original window once the watermark has advanced past their timestamp.
 
-## Limitations
-
-* Windowing is event-count based instead of time-based
-* No fault tolerance for processor state
-* Python-based processor instead of native Flink
-
-## Conclusion
-
-The system successfully demonstrates a real-time feature pipeline with streaming ingestion, transformation, and visualization. It captures key concepts used in production-grade ML pipelines.
+Overall, the pipeline is designed so that late arrival is tolerated within the specified window, but genuinely tardy events are still tracked and surfaced as operational telemetry.
