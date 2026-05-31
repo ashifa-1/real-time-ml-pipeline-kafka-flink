@@ -1,74 +1,58 @@
-import json
-from datetime import datetime, timezone
-
-from pyflink.common import Duration, Types
-from pyflink.common.serialization import SimpleStringSchema
-from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.datastream.connectors.kafka import KafkaSource, KafkaSink
-from pyflink.common.watermark_strategy import WatermarkStrategy
+import os
 from pyflink.table import EnvironmentSettings, StreamTableEnvironment
 
-KAFKA_BOOTSTRAP_SERVERS = "kafka:9092"
-USER_EVENTS_TOPIC = "user-events"
-CONTENT_METADATA_TOPIC = "content-metadata"
-FEATURE_STORE_TOPIC = "feature-store"
-METRICS_TOPIC = "pipeline-metrics"
-
-
-def iso_to_epoch_ms(iso_ts):
-    dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
-    return int(dt.timestamp() * 1000)
-
-
-def event_time_assigner(value, record_timestamp):
-    data = json.loads(value)
-    return iso_to_epoch_ms(data["timestamp"])
-
-
 def main():
-    env = StreamExecutionEnvironment.get_execution_environment()
-    env.set_parallelism(1)
-
+    # Initialize high-performance unified Flink Table Environment
     settings = EnvironmentSettings.new_instance().in_streaming_mode().build()
     t_env = StreamTableEnvironment.create(environment_settings=settings)
+    
+    config = t_env.get_config().get_configuration()
+    config.set_string("parallelism.default", "1")
+    config.set_string("pipeline.auto-watermark-interval", "200ms")
+    
+    kafka_server = "kafka:9092"
 
-    t_env.get_config().get_configuration().set_string("parallelism.default", "1")
-
+    # Source: User Interaction Events with a Bounded Out-Of-Orderness Watermark Strategy (30s)
     t_env.execute_sql(f"""
         CREATE TABLE user_events (
             user_id STRING,
             content_id STRING,
             event_type STRING,
             dwell_time_ms INT,
-            ts TIMESTAMP_LTZ(3),
+            event_time_str STRING,
+            ts AS TO_TIMESTAMP_LTZ(CAST(TO_TIMESTAMP(REPLACE(event_time_str, 'Z', ''), 'yyyy-MM-dd''T''HH:mm:ss.SSS') AS BIGINT) * 1000, 3),
             WATERMARK FOR ts AS ts - INTERVAL '30' SECOND
         ) WITH (
             'connector' = 'kafka',
-            'topic' = '{USER_EVENTS_TOPIC}',
-            'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP_SERVERS}',
-            'properties.group.id' = 'flink-user-events',
+            'topic' = 'user-events',
+            'properties.bootstrap.servers' = '{kafka_server}',
+            'properties.group.id' = 'flink-user-events-group',
+            'scan.startup.mode' = 'latest-offset',
             'format' = 'json',
+            'json.ignore-parse-errors' = 'true',
             'json.timestamp-format.standard' = 'ISO-8601'
         )
     """)
 
+    # Source: Changelog Table from Compacted Content Metadata
     t_env.execute_sql(f"""
         CREATE TABLE content_metadata (
             content_id STRING,
             category STRING,
             creator_id STRING,
-            publish_timestamp TIMESTAMP_LTZ(3),
-            WATERMARK FOR publish_timestamp AS publish_timestamp - INTERVAL '1' SECOND
+            publish_timestamp STRING,
+            PRIMARY KEY (content_id) NOT ENFORCED
         ) WITH (
             'connector' = 'kafka',
-            'topic' = '{CONTENT_METADATA_TOPIC}',
-            'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP_SERVERS}',
-            'properties.group.id' = 'flink-content-metadata',
-            'format' = 'json',
-            'json.timestamp-format.standard' = 'ISO-8601'
+            'topic' = 'content-metadata',
+            'properties.bootstrap.servers' = '{kafka_server}',
+            'properties.group.id' = 'flink-metadata-group',
+            'scan.startup.mode' = 'earliest-offset',
+            'format' = 'json'
         )
     """)
 
+    # Sink: Upsert-Kafka Target for the Unified Feature Store Backend
     t_env.execute_sql(f"""
         CREATE TABLE feature_store (
             entity_id STRING,
@@ -78,13 +62,14 @@ def main():
             PRIMARY KEY (entity_id, feature_name) NOT ENFORCED
         ) WITH (
             'connector' = 'upsert-kafka',
-            'topic' = '{FEATURE_STORE_TOPIC}',
-            'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP_SERVERS}',
+            'topic' = 'feature-store',
+            'properties.bootstrap.servers' = '{kafka_server}',
             'key.format' = 'json',
             'value.format' = 'json'
         )
     """)
 
+    # Sink: Metric logs for system observability
     t_env.execute_sql(f"""
         CREATE TABLE pipeline_metrics (
             watermark_ms BIGINT,
@@ -93,114 +78,84 @@ def main():
             generated_at STRING
         ) WITH (
             'connector' = 'kafka',
-            'topic' = '{METRICS_TOPIC}',
-            'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP_SERVERS}',
+            'topic' = 'pipeline-metrics',
+            'properties.bootstrap.servers' = '{kafka_server}',
             'format' = 'json'
         )
     """)
 
-    t_env.execute_sql("""
+    # Create an atomic execution batch set
+    statement_set = t_env.create_statement_set()
+
+    # Feature 1: User Click Rate (1-Hour Tumbling Window)
+    statement_set.add_insert_sql("""
         INSERT INTO feature_store
-        SELECT user_id AS entity_id,
-               'avg_dwell_time' AS feature_name,
-               CAST(AVG(dwell_time_ms) AS STRING) AS feature_value,
-               CAST(MAX(ts) AS STRING) AS computed_at
+        SELECT 
+            user_id AS entity_id,
+            'click_rate' AS feature_name,
+            CAST(CAST(SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END) AS DOUBLE) / COUNT(*) AS STRING) AS feature_value,
+            DATE_FORMAT(MAX(ts), 'yyyy-MM-dd''T''HH:mm:ss.SSS''Z''') AS computed_at
         FROM user_events
         GROUP BY TUMBLE(ts, INTERVAL '1' HOUR), user_id
     """)
 
-    t_env.execute_sql("""
+    # Feature 2: User Average Dwell Time (1-Hour Tumbling Window)
+    statement_set.add_insert_sql("""
         INSERT INTO feature_store
-        SELECT user_id AS entity_id,
-               'click_rate' AS feature_name,
-               CAST(SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END) / COUNT(*) AS STRING) AS feature_value,
-               CAST(MAX(ts) AS STRING) AS computed_at
+        SELECT 
+            user_id AS entity_id,
+            'avg_dwell_time' AS feature_name,
+            CAST(AVG(dwell_time_ms) AS STRING) AS feature_value,
+            DATE_FORMAT(MAX(ts), 'yyyy-MM-dd''T''HH:mm:ss.SSS''Z''') AS computed_at
         FROM user_events
         GROUP BY TUMBLE(ts, INTERVAL '1' HOUR), user_id
     """)
 
-    t_env.execute_sql("""
+    # Feature 3: Per-Content Engagement Rate (15-Minute Sliding Window, 5-Minute Slide)
+    statement_set.add_insert_sql("""
         INSERT INTO feature_store
-        SELECT user_id AS entity_id,
-               'engagement_rate' AS feature_name,
-               CAST(SUM(CASE WHEN event_type IN ('click', 'like', 'share') THEN 1 ELSE 0 END) / COUNT(*) AS STRING) AS feature_value,
-               CAST(MAX(ts) AS STRING) AS computed_at
+        SELECT 
+            content_id AS entity_id,
+            'engagement_rate' AS feature_name,
+            CAST(
+                CASE WHEN COUNT(CASE WHEN event_type = 'view' THEN 1 END) = 0 THEN 0.0
+                ELSE CAST(SUM(CASE WHEN event_type IN ('like', 'share') THEN 1 ELSE 0 END) AS DOUBLE) / 
+                     COUNT(CASE WHEN event_type = 'view' THEN 1 END)
+                END AS STRING
+            ) AS feature_value,
+            DATE_FORMAT(MAX(ts), 'yyyy-MM-dd''T''HH:mm:ss.SSS''Z''') AS computed_at
         FROM user_events
-        GROUP BY TUMBLE(ts, INTERVAL '1' HOUR), user_id
+        GROUP BY HOP(ts, INTERVAL '5' MINUTE, INTERVAL '15' MINUTE), content_id
     """)
 
-    t_env.execute_sql("""
+    # Feature 4: User Category Affinity via Stream-Table Temporal Join (1-Hour Tumbling Window)
+    statement_set.add_insert_sql("""
         INSERT INTO feature_store
-        SELECT e.content_id AS entity_id,
-               'content_category' AS feature_name,
-               m.category AS feature_value,
-               CAST(MAX(e.ts) AS STRING) AS computed_at
+        SELECT 
+            e.user_id AS entity_id,
+            CONCAT('category_affinity_score_', COALESCE(m.category, 'unknown')) AS feature_name,
+            CAST(COUNT(*) AS STRING) AS feature_value,
+            DATE_FORMAT(MAX(e.ts), 'yyyy-MM-dd''T''HH:mm:ss.SSS''Z''') AS computed_at
         FROM user_events AS e
         LEFT JOIN content_metadata FOR SYSTEM_TIME AS OF e.ts AS m
             ON e.content_id = m.content_id
-        GROUP BY TUMBLE(e.ts, INTERVAL '15' MINUTE), e.content_id, m.category
+        GROUP BY TUMBLE(e.ts, INTERVAL '1' HOUR), e.user_id, m.category
     """)
 
-    t_env.execute_sql("""
-        INSERT INTO feature_store
-        SELECT m.category AS entity_id,
-               'category_avg_dwell' AS feature_name,
-               CAST(AVG(e.dwell_time_ms) AS STRING) AS feature_value,
-               CAST(MAX(e.ts) AS STRING) AS computed_at
-        FROM user_events AS e
-        LEFT JOIN content_metadata FOR SYSTEM_TIME AS OF e.ts AS m
-            ON e.content_id = m.content_id
-        GROUP BY TUMBLE(e.ts, INTERVAL '15' MINUTE), m.category
+    # Instrumentation pipeline to pass metrics directly to our dashboard
+    statement_set.add_insert_sql("""
+        INSERT INTO pipeline_metrics
+        SELECT 
+            CAST(CURRENT_WATERMARK(ts) AS BIGINT) AS watermark_ms,
+            CAST(UNIX_TIMESTAMP() * 1000 AS BIGINT) AS wall_clock_ms,
+            CAST(SUM(CASE WHEN ts < CURRENT_WATERMARK(ts) THEN 1 ELSE 0 END) AS BIGINT) AS late_event_count,
+            DATE_FORMAT(CURRENT_TIMESTAMP, 'yyyy-MM-dd''T''HH:mm:ss.SSS''Z''') AS generated_at
+        FROM user_events
+        GROUP BY TUMBLE(ts, INTERVAL '10' SECOND)
     """)
 
-    source = KafkaSource.builder() \
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP_SERVERS) \
-        .set_topics(USER_EVENTS_TOPIC) \
-        .set_group_id("flink-metrics-group") \
-        .set_value_only_deserializer(SimpleStringSchema()) \
-        .build()
-
-    watermark_strategy = WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_seconds(30)) \
-        .with_timestamp_assigner(lambda element, record_timestamp: event_time_assigner(element, record_timestamp))
-
-    metrics_stream = env.from_source(source, watermark_strategy, "metric-source")
-
-    class MetricsMapper:
-        def open(self, runtime_context):
-            self.late_event_count = 0
-            self.last_watermark = -1
-
-        def map(self, value):
-            data = json.loads(value)
-            event_ts = iso_to_epoch_ms(data["timestamp"])
-            watermark = self.last_watermark
-            if watermark > 0 and event_ts < watermark:
-                self.late_event_count += 1
-            self.last_watermark = watermark
-            return {
-                "watermark_ms": self.last_watermark,
-                "wall_clock_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
-                "late_event_count": self.late_event_count,
-                "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            }
-
-    metrics_json = metrics_stream.map(lambda value: json.dumps({
-        "watermark_ms": iso_to_epoch_ms(json.loads(value)["timestamp"]),
-        "wall_clock_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
-        "late_event_count": 0,
-        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }), output_type=Types.STRING())
-
-    sink = KafkaSink.builder() \
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP_SERVERS) \
-        .set_record_serializer(SimpleStringSchema()) \
-        .set_topic(METRICS_TOPIC) \
-        .build()
-
-    metrics_json.sink_to(sink)
-
-    t_env.execute("feature-engineering-job")
-
+    # Trigger job execution
+    statement_set.execute()
 
 if __name__ == '__main__':
     main()
